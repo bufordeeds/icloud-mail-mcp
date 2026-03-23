@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 ICLOUD_EMAIL = os.getenv("ICLOUD_EMAIL", "")
+ICLOUD_IMAP_USER = os.getenv("ICLOUD_IMAP_USER", ICLOUD_EMAIL)
 ICLOUD_APP_PASSWORD = os.getenv("ICLOUD_APP_PASSWORD", "")
 IMAP_HOST = "imap.mail.me.com"
 IMAP_PORT = 993
@@ -35,7 +36,7 @@ def _imap_connection():
     """Open a short-lived IMAP connection, log in, and yield the client."""
     client = IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True)
     try:
-        client.login(ICLOUD_EMAIL, ICLOUD_APP_PASSWORD)
+        client.login(ICLOUD_IMAP_USER, ICLOUD_APP_PASSWORD)
         yield client
     finally:
         try:

@@ -47,7 +47,12 @@ mcp = FastMCP("icloud-mail")
 # ---------------------------------------------------------------------------
 
 class _HTMLStripper(HTMLParser):
-    """Accumulate visible text, skipping script/style blocks."""
+    """Accumulate visible text, skipping script/style blocks.
+
+    Emits a single space on every non-skipped tag boundary so that words
+    separated only by tags (e.g. ``<p>A</p><p>B</p>``) don't fuse into one
+    token. The final ``" ".join(text.split())`` collapses runs.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -57,10 +62,14 @@ class _HTMLStripper(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list) -> None:
         if tag.lower() in ("script", "style"):
             self._skip = True
+        elif not self._skip:
+            self._parts.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() in ("script", "style"):
             self._skip = False
+        elif not self._skip:
+            self._parts.append(" ")
 
     def handle_data(self, data: str) -> None:
         if not self._skip:
@@ -87,7 +96,7 @@ def _strip_html(html: str) -> str:
 # ---------------------------------------------------------------------------
 
 @contextmanager
-def _imap_connection(readonly: bool = True):
+def _imap_connection():
     """Open a short-lived IMAP connection, log in, and yield the client."""
     client = IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True)
     try:
@@ -176,12 +185,19 @@ def _build_email(
     return msg
 
 
-def _find_special_folder(client: IMAPClient, flag: str, fallback: str) -> str:
-    """Return the folder name matching an IMAP special-use flag, or fallback."""
+def _find_special_folder(client: IMAPClient, flag: bytes, fallback: str) -> str:
+    """Return the folder name matching an IMAP special-use flag, or fallback.
+
+    IMAPClient returns folder flags as ``bytes`` (e.g. ``b"\\Drafts"``).
+    ``str()`` on a bytes object yields a ``"b'...'"`` repr that can never
+    equal a plain-string target, so we compare bytes-to-bytes.
+    """
     flag_lower = flag.lower()
     for folder_flags, _delimiter, name in client.list_folders():
-        if any(str(f).lower() == flag_lower for f in folder_flags):
-            return name
+        for f in folder_flags:
+            f_bytes = f if isinstance(f, bytes) else str(f).encode("ascii", "ignore")
+            if f_bytes.lower() == flag_lower:
+                return name
     return fallback
 
 
@@ -386,7 +402,9 @@ def delete_messages(message_ids: list[int], mailbox: str = "INBOX") -> dict:
     """Move specific messages to Trash.
 
     Moves to the account Trash folder rather than immediately expunging,
-    preserving a recovery window.
+    preserving a recovery window. On iCloud the trash folder is named
+    ``Deleted Messages`` — the special-use flag lookup resolves that
+    automatically, and the fallback matches if the flag is absent.
 
     Args:
         message_ids: List of message UIDs to delete.
@@ -398,7 +416,7 @@ def delete_messages(message_ids: list[int], mailbox: str = "INBOX") -> dict:
     if not message_ids:
         raise ValueError("message_ids must not be empty")
     with _imap_connection() as client:
-        trash_folder = _find_special_folder(client, "\\\\Trash", "Trash")
+        trash_folder = _find_special_folder(client, b"\\Trash", "Deleted Messages")
         client.select_folder(mailbox, readonly=False)
         client.move(message_ids, trash_folder)
         return {
@@ -483,7 +501,7 @@ def create_draft(
     raw_bytes = msg.as_bytes()
 
     with _imap_connection() as client:
-        drafts_folder = _find_special_folder(client, "\\\\Drafts", "Drafts")
+        drafts_folder = _find_special_folder(client, b"\\Drafts", "Drafts")
         client.append(drafts_folder, raw_bytes)
         return {
             "status": "draft_created",

@@ -2,13 +2,14 @@
 
 import os
 import smtplib
+import sys
 from contextlib import contextmanager
 from datetime import datetime
 from email import policy
-from email.headerregistry import Address
 from email.message import EmailMessage
 from email.parser import BytesParser
-from email.utils import format_datetime, parseaddr
+from email.utils import format_datetime
+from html.parser import HTMLParser
 
 from dotenv import load_dotenv
 from imapclient import IMAPClient
@@ -24,7 +25,61 @@ IMAP_PORT = 993
 SMTP_HOST = "smtp.mail.me.com"
 SMTP_PORT = 587
 
+# ---------------------------------------------------------------------------
+# Startup validation — fail loudly rather than silently
+# ---------------------------------------------------------------------------
+
+_missing = [v for v in ("ICLOUD_EMAIL", "ICLOUD_APP_PASSWORD") if not os.getenv(v)]
+if _missing:
+    print(
+        f"ERROR: Required environment variable(s) not set: {', '.join(_missing)}\n"
+        "Set ICLOUD_EMAIL and ICLOUD_APP_PASSWORD (use an app-specific password "
+        "generated at appleid.apple.com) before starting the server.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 mcp = FastMCP("icloud-mail")
+
+
+# ---------------------------------------------------------------------------
+# HTML stripping — stdlib html.parser, handles malformed markup gracefully
+# ---------------------------------------------------------------------------
+
+class _HTMLStripper(HTMLParser):
+    """Accumulate visible text, skipping script/style blocks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag.lower() in ("script", "style"):
+            self._skip = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in ("script", "style"):
+            self._skip = False
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return " ".join("".join(self._parts).split())
+
+
+def _strip_html(html: str) -> str:
+    stripper = _HTMLStripper()
+    try:
+        stripper.feed(html)
+        return stripper.get_text()
+    except Exception:
+        # Last-resort fallback — should rarely trigger with stdlib parser
+        import re
+        text = re.sub(r"<[^>]+>", " ", html)
+        return " ".join(text.split())
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +87,7 @@ mcp = FastMCP("icloud-mail")
 # ---------------------------------------------------------------------------
 
 @contextmanager
-def _imap_connection():
+def _imap_connection(readonly: bool = True):
     """Open a short-lived IMAP connection, log in, and yield the client."""
     client = IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True)
     try:
@@ -45,7 +100,7 @@ def _imap_connection():
             pass
 
 
-def _smtp_send(msg: EmailMessage):
+def _smtp_send(msg: EmailMessage) -> None:
     """Send an EmailMessage via iCloud SMTP."""
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
         smtp.ehlo()
@@ -60,22 +115,17 @@ def _extract_text(raw_bytes: bytes) -> str:
     parser = BytesParser(policy=policy.default)
     msg = parser.parsebytes(raw_bytes)
 
-    # Prefer plain text
     body = msg.get_body(preferencelist=("plain",))
     if body is not None:
         content = body.get_content()
         if isinstance(content, str):
             return content.strip()
 
-    # Fall back to HTML, strip tags naively
     body = msg.get_body(preferencelist=("html",))
     if body is not None:
         content = body.get_content()
         if isinstance(content, str):
-            import re
-            text = re.sub(r"<[^>]+>", " ", content)
-            text = re.sub(r"\s+", " ", text)
-            return text.strip()
+            return _strip_html(content)
 
     return ""
 
@@ -84,16 +134,13 @@ def _header(raw_bytes: bytes, name: str) -> str:
     """Extract a single header value from raw bytes."""
     parser = BytesParser(policy=policy.default)
     msg = parser.parsebytes(raw_bytes)
-    val = msg.get(name, "")
-    return str(val)
+    return str(msg.get(name, ""))
 
 
 def _snippet(text: str, length: int = 120) -> str:
     """Return the first `length` characters of text as a snippet."""
-    text = " ".join(text.split())  # collapse whitespace
-    if len(text) > length:
-        return text[:length] + "..."
-    return text
+    text = " ".join(text.split())
+    return text[:length] + "..." if len(text) > length else text
 
 
 def _message_summary(uid: int, raw_bytes: bytes) -> dict:
@@ -129,6 +176,15 @@ def _build_email(
     return msg
 
 
+def _find_special_folder(client: IMAPClient, flag: str, fallback: str) -> str:
+    """Return the folder name matching an IMAP special-use flag, or fallback."""
+    flag_lower = flag.lower()
+    for folder_flags, _delimiter, name in client.list_folders():
+        if any(str(f).lower() == flag_lower for f in folder_flags):
+            return name
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
@@ -141,13 +197,10 @@ def list_mailboxes() -> list[dict]:
     """
     with _imap_connection() as client:
         folders = client.list_folders()
-        results = []
-        for flags, delimiter, name in folders:
-            results.append({
-                "name": name,
-                "flags": [str(f) for f in flags],
-            })
-        return results
+        return [
+            {"name": name, "flags": [str(f) for f in flags]}
+            for flags, _delimiter, name in folders
+        ]
 
 
 @mcp.tool()
@@ -161,18 +214,16 @@ def list_messages(mailbox: str = "INBOX", count: int = 20) -> list[dict]:
     count = min(max(1, count), 100)
     with _imap_connection() as client:
         client.select_folder(mailbox, readonly=True)
-        # Get the most recent UIDs
         uids = client.search(["ALL"])
-        uids = uids[-count:]  # last N
+        uids = uids[-count:]
         if not uids:
             return []
-        # Fetch headers + a bit of body for snippets
         fetched = client.fetch(uids, ["RFC822"])
-        results = []
-        for uid in uids:
-            raw = fetched.get(uid, {}).get(b"RFC822", b"")
-            if raw:
-                results.append(_message_summary(uid, raw))
+        results = [
+            _message_summary(uid, fetched[uid][b"RFC822"])
+            for uid in uids
+            if uid in fetched and b"RFC822" in fetched[uid]
+        ]
         results.reverse()  # newest first
         return results
 
@@ -230,33 +281,36 @@ def search_messages(
     with _imap_connection() as client:
         client.select_folder(mailbox, readonly=True)
         uids = client.search(criteria)
-        uids = uids[-count:]  # take last N (most recent)
+        uids = uids[-count:]
         if not uids:
             return []
         fetched = client.fetch(uids, ["RFC822"])
-        results = []
-        for uid in uids:
-            raw = fetched.get(uid, {}).get(b"RFC822", b"")
-            if raw:
-                results.append(_message_summary(uid, raw))
+        results = [
+            _message_summary(uid, fetched[uid][b"RFC822"])
+            for uid in uids
+            if uid in fetched and b"RFC822" in fetched[uid]
+        ]
         results.reverse()
         return results
 
 
 @mcp.tool()
 def read_message(message_id: int, mailbox: str = "INBOX") -> dict:
-    """Read a full email message by its ID (UID).
+    """Read a full email message by its UID.
 
     Args:
         message_id: The UID of the message to read.
         mailbox: The mailbox containing the message (default "INBOX").
+
+    Raises:
+        ValueError: If the message is not found.
     """
     with _imap_connection() as client:
         client.select_folder(mailbox, readonly=True)
         fetched = client.fetch([message_id], ["RFC822"])
         raw = fetched.get(message_id, {}).get(b"RFC822", b"")
         if not raw:
-            return {"error": f"Message {message_id} not found in {mailbox}"}
+            raise ValueError(f"Message {message_id} not found in {mailbox}")
 
         parser = BytesParser(policy=policy.default)
         msg = parser.parsebytes(raw)
@@ -272,24 +326,114 @@ def read_message(message_id: int, mailbox: str = "INBOX") -> dict:
             "reply_to": str(msg.get("Reply-To", "")),
         }
 
-        body_text = _extract_text(raw)
-
-        # List attachments
-        attachments = []
-        for part in msg.walk():
-            content_disposition = str(part.get("Content-Disposition", ""))
-            if "attachment" in content_disposition:
-                filename = part.get_filename() or "unnamed"
-                attachments.append({
-                    "filename": filename,
-                    "content_type": part.get_content_type(),
-                })
+        attachments = [
+            {
+                "filename": part.get_filename() or "unnamed",
+                "content_type": part.get_content_type(),
+            }
+            for part in msg.walk()
+            if "attachment" in str(part.get("Content-Disposition", ""))
+        ]
 
         return {
             "id": message_id,
             "headers": headers,
-            "body": body_text,
+            "body": _extract_text(raw),
             "attachments": attachments,
+        }
+
+
+@mcp.tool()
+def mark_as_read(message_ids: list[int], mailbox: str = "INBOX") -> dict:
+    """Mark specific messages as read.
+
+    Args:
+        message_ids: List of message UIDs to mark as read.
+        mailbox: The mailbox containing the messages (default "INBOX").
+
+    Raises:
+        ValueError: If message_ids is empty.
+    """
+    if not message_ids:
+        raise ValueError("message_ids must not be empty")
+    with _imap_connection() as client:
+        client.select_folder(mailbox, readonly=False)
+        client.add_flags(message_ids, [b"\\Seen"])
+        return {"status": "ok", "marked_read": len(message_ids)}
+
+
+@mcp.tool()
+def mark_as_unread(message_ids: list[int], mailbox: str = "INBOX") -> dict:
+    """Mark specific messages as unread.
+
+    Args:
+        message_ids: List of message UIDs to mark as unread.
+        mailbox: The mailbox containing the messages (default "INBOX").
+
+    Raises:
+        ValueError: If message_ids is empty.
+    """
+    if not message_ids:
+        raise ValueError("message_ids must not be empty")
+    with _imap_connection() as client:
+        client.select_folder(mailbox, readonly=False)
+        client.remove_flags(message_ids, [b"\\Seen"])
+        return {"status": "ok", "marked_unread": len(message_ids)}
+
+
+@mcp.tool()
+def delete_messages(message_ids: list[int], mailbox: str = "INBOX") -> dict:
+    """Move specific messages to Trash.
+
+    Moves to the account Trash folder rather than immediately expunging,
+    preserving a recovery window.
+
+    Args:
+        message_ids: List of message UIDs to delete.
+        mailbox: The mailbox containing the messages (default "INBOX").
+
+    Raises:
+        ValueError: If message_ids is empty.
+    """
+    if not message_ids:
+        raise ValueError("message_ids must not be empty")
+    with _imap_connection() as client:
+        trash_folder = _find_special_folder(client, "\\\\Trash", "Trash")
+        client.select_folder(mailbox, readonly=False)
+        client.move(message_ids, trash_folder)
+        return {
+            "status": "ok",
+            "deleted": len(message_ids),
+            "moved_to": trash_folder,
+        }
+
+
+@mcp.tool()
+def move_messages(
+    message_ids: list[int],
+    destination: str,
+    mailbox: str = "INBOX",
+) -> dict:
+    """Move specific messages to another mailbox.
+
+    Args:
+        message_ids: List of message UIDs to move.
+        destination: Name of the destination mailbox.
+        mailbox: Source mailbox (default "INBOX").
+
+    Raises:
+        ValueError: If message_ids is empty.
+    """
+    if not message_ids:
+        raise ValueError("message_ids must not be empty")
+    with _imap_connection() as client:
+        client.select_folder(mailbox, readonly=False)
+        client.move(message_ids, destination)
+        return {
+            "status": "ok",
+            "moved": len(message_ids),
+            "from": mailbox,
+            "to": destination,
         }
 
 
@@ -309,13 +453,13 @@ def send_message(
         body: Plain text email body.
         cc: CC recipients (comma-separated, optional).
         bcc: BCC recipients (comma-separated, optional).
+
+    Raises:
+        Exception: If the message fails to send.
     """
     msg = _build_email(to, subject, body, cc=cc, bcc=bcc)
-    try:
-        _smtp_send(msg)
-        return {"status": "sent", "to": to, "subject": subject}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    _smtp_send(msg)  # raises on failure — callers see real errors
+    return {"status": "sent", "to": to, "subject": subject}
 
 
 @mcp.tool()
@@ -339,14 +483,7 @@ def create_draft(
     raw_bytes = msg.as_bytes()
 
     with _imap_connection() as client:
-        # Find the Drafts folder — iCloud uses "Drafts"
-        drafts_folder = "Drafts"
-        folders = client.list_folders()
-        for flags, delimiter, name in folders:
-            if "\\Drafts" in [str(f) for f in flags] or name.lower() == "drafts":
-                drafts_folder = name
-                break
-
+        drafts_folder = _find_special_folder(client, "\\\\Drafts", "Drafts")
         client.append(drafts_folder, raw_bytes)
         return {
             "status": "draft_created",
